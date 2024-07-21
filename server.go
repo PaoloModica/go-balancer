@@ -3,7 +3,6 @@ package load_balancer
 import (
 	"fmt"
 	"net/http"
-	"os"
 )
 
 type BasicServer struct {
@@ -20,6 +19,11 @@ func NewServer() *BasicServer {
 }
 
 func homeRouteHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("Received request from %v", r.Header.Get("Host"))
-	r.WriteProxy(os.Stdout)
+	fmt.Printf("Received request from %v\n", r.Header.Get("Host"))
+	fmt.Printf("%v %v %v\n", r.Method, r.URL, r.Proto)
+	fmt.Printf("Host %v:\n", r.Host)
+	fmt.Printf("User-Agent: %v\n", r.UserAgent())
+	fmt.Printf("Accept: %v\n", r.Header.Get("Accept-Encoding"))
+
+	fmt.Fprintf(w, "hello %v", r.Host)
 }

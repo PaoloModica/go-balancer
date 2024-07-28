@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -14,10 +15,10 @@ type loadBalancerTestCase struct {
 	route  string
 }
 
-func testServer(t *testing.T, addr string, port int) *httptest.Server {
+func testServer(t *testing.T, addr string) *httptest.Server {
 	t.Helper()
 
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", addr, port))
+	l, err := net.Listen("tcp", addr)
 
 	if err != nil {
 		t.Errorf("an error occurred while creating test server: %v", err)
@@ -36,19 +37,55 @@ func testServer(t *testing.T, addr string, port int) *httptest.Server {
 	return ts
 }
 
+func TestBackendServerScheduleManager(t *testing.T) {
+	serverList := []string{
+		"127.0.0.1:5001",
+		"127.0.0.1:5002",
+	}
+	mu := &sync.Mutex{}
+	t.Run("backendServerId less than length of list of address", func(t *testing.T) {
+		bm := load_balancer.BackendServerScheduleManager{
+			serverList,
+			0,
+			mu,
+		}
+		expectedBaseUrl := "http://127.0.0.1:5001"
+		gotBaseUrl := bm.GetNextServerAddress()
+
+		if expectedBaseUrl != gotBaseUrl {
+			t.Errorf("expected %s, got %s base URL string", expectedBaseUrl, gotBaseUrl)
+		}
+	})
+	t.Run("backendServerId equal to length of list of address", func(t *testing.T) {
+		bm := load_balancer.BackendServerScheduleManager{
+			serverList,
+			2,
+			mu,
+		}
+		expectedBaseUrl := "http://127.0.0.1:5001"
+		gotBaseUrl := bm.GetNextServerAddress()
+
+		if expectedBaseUrl != gotBaseUrl {
+			t.Errorf("expected %s, got %s base URL string", expectedBaseUrl, gotBaseUrl)
+		}
+	})
+}
+
 func TestLoadBalancer(t *testing.T) {
 	testCases := []loadBalancerTestCase{
-		{http.MethodGet, "/ "},
+		{http.MethodGet, "/"},
 		{http.MethodPost, "/"},
 	}
 	for _, testCase := range testCases {
 		t.Run(fmt.Sprintf("%s %s forwards the request to back-end service and returns 200 OK", testCase.method, testCase.route), func(t *testing.T) {
-			tsAddr := "127.0.0.1"
-			tsPort := 5000
+			addresses := []string{
+				"127.0.0.1:5001",
+				"127.0.0.1:5002",
+			}
 
-			loadBalancer := load_balancer.NewLoadBalancerServer(tsAddr, tsPort)
+			loadBalancer := load_balancer.NewLoadBalancerServer(addresses)
 
-			ts := testServer(t, tsAddr, tsPort)
+			ts := testServer(t, addresses[0])
 			defer ts.Close()
 
 			request, _ := http.NewRequest(testCase.method, testCase.route, nil)

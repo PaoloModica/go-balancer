@@ -5,9 +5,30 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
+
+type BackendHealthChecker interface {
+	ScheduleHealthCheck(duration time.Duration, route string, bm *BackendServerScheduleManager)
+}
+
+type BackendHealthCheckerFunc func(time.Duration, string, *BackendServerScheduleManager)
+
+func (b BackendHealthCheckerFunc) ScheduleHealthCheck(duration time.Duration, route string, bm *BackendServerScheduleManager) {
+	b(duration, route, bm)
+}
+
+func HealthChecker(duration time.Duration, route string, bm *BackendServerScheduleManager) {
+	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
+
+	for t := range ticker.C {
+		log.Printf("Health checking at %v", t)
+		bm.CheckServerHealth(route, 30*time.Second)
+	}
+}
 
 type RequestResult struct {
 	StatusCode int
@@ -28,22 +49,73 @@ func (bm *BackendServerScheduleManager) GetNextServerAddress() string {
 	bm.NextServerIdMutex.Lock()
 	defer bm.NextServerIdMutex.Unlock()
 
-	var i int
-
-	if bm.NextServerId <= len(bm.ServerList)-1 {
-		i = bm.NextServerId
-		bm.NextServerId = bm.NextServerId + 1
-	} else {
-		i = 0
+	if bm.NextServerId > len(bm.ServerList)-1 {
 		bm.NextServerId = 0
 	}
 
-	baseUrl := fmt.Sprintf("http://%s", bm.ServerList[i])
+	baseUrl := fmt.Sprintf("http://%s", bm.ServerList[bm.NextServerId])
+	bm.NextServerId += 1
 
 	return baseUrl
 }
 
-func NewLoadBalancerServer(addresses []string) *LoadBalancerServer {
+func (bm *BackendServerScheduleManager) CheckServerHealth(healthcheckRoute string, timeout time.Duration) {
+	results := make(chan RequestResult, len(bm.ServerList))
+	var wg sync.WaitGroup
+
+	log.Printf("health checking back-end: %v", bm.ServerList)
+
+	for i, baseUrl := range bm.ServerList {
+		wg.Add(1)
+		go func(baseUrl string, i int) {
+			defer wg.Done()
+
+			url := fmt.Sprintf("http://%s%s", baseUrl, healthcheckRoute)
+			log.Printf("sending request to %s", url)
+			req, err := http.NewRequest(http.MethodGet, url, nil)
+			if err != nil {
+				log.Printf("an error occured while sending %s request to back-end server: %s", url, err)
+				results <- RequestResult{StatusCode: http.StatusInternalServerError, Message: []byte(fmt.Sprint(i))}
+				return
+			}
+			client := http.Client{Timeout: timeout}
+			defer client.CloseIdleConnections()
+
+			res, err := client.Do(req)
+
+			if err != nil {
+				log.Printf("an error occured while forwarding request to %s: %s", url, err)
+				results <- RequestResult{StatusCode: http.StatusInternalServerError, Message: []byte(fmt.Sprint(i))}
+				return
+			}
+
+			log.Printf("%s status: %d", url, res.StatusCode)
+
+			results <- RequestResult{StatusCode: res.StatusCode, Message: []byte(fmt.Sprint(i))}
+		}(baseUrl, i)
+	}
+
+	wg.Wait()
+	close(results)
+
+	bm.NextServerIdMutex.Lock()
+	defer bm.NextServerIdMutex.Unlock()
+
+	for r := range results {
+		if r.StatusCode != http.StatusOK {
+			index, err := strconv.Atoi(string(r.Message))
+
+			if err != nil {
+				log.Printf("an error occured while checking result %s", err)
+			}
+
+			bm.ServerList = append(bm.ServerList[:index], bm.ServerList[index+1:]...)
+		}
+	}
+	log.Printf("healthcheck completed, online services: %v", bm.ServerList)
+}
+
+func NewLoadBalancerServer(addresses []string, healthchecker BackendHealthChecker, healthcheckPeriod time.Duration, healthcheckRoute string) *LoadBalancerServer {
 	resultsChannel := make(chan RequestResult)
 
 	bm := BackendServerScheduleManager{
@@ -55,6 +127,9 @@ func NewLoadBalancerServer(addresses []string) *LoadBalancerServer {
 	router := http.NewServeMux()
 	router.Handle("/", http.HandlerFunc(forwardToBackend(bm, resultsChannel)))
 	log.Printf("back-end server addresses: %v", addresses)
+
+	go healthchecker.ScheduleHealthCheck(healthcheckPeriod, healthcheckRoute, &bm)
+
 	return &LoadBalancerServer{router}
 }
 
